@@ -37,27 +37,43 @@ async def qr_login(client: TelegramClient) -> bool:
     print("  (Telegram → Settings → Devices → Link Desktop Device)\n")
     _render_qr(qr.url)
 
-    while True:
+    max_attempts = 20
+    for attempt in range(max_attempts):
         try:
-            # wait() raises asyncio.TimeoutError when the QR expires
-            await qr.wait(timeout=30)
+            await qr.wait(timeout=15)
             print("\nQR login successful!")
             return True
         except asyncio.TimeoutError:
+            # Check if we got authorized while waiting
+            if await client.is_user_authorized():
+                print("\nQR login successful!")
+                return True
             # QR expired — regenerate
             try:
                 await qr.recreate()
-                print("\nQR code expired — scan the new one:\n")
+                print(f"\nQR code expired — scan the new one (attempt {attempt + 2}/{max_attempts}):\n")
                 _render_qr(qr.url)
             except Exception:
-                # Three consecutive failures → give up
+                # Check one more time if authorized
+                if await client.is_user_authorized():
+                    print("\nQR login successful!")
+                    return True
                 return False
         except SessionPasswordNeededError:
-            # 2FA enabled — need password after QR scan
             return await _handle_2fa(client)
         except Exception as exc:
+            # Some exceptions are thrown on successful login too
+            if await client.is_user_authorized():
+                print("\nQR login successful!")
+                return True
             print(f"\nQR login error: {exc}")
             return False
+
+    # Final check
+    if await client.is_user_authorized():
+        print("\nQR login successful!")
+        return True
+    return False
 
 
 def _render_qr(data: str) -> None:
