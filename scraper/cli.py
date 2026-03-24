@@ -218,9 +218,8 @@ def _get_scrape_config() -> dict:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _progress(fetched: int, total: int | None) -> None:
-    total_str = str(total) if total else "all"
-    print(f"\r  Fetched {fetched} / {total_str} messages...", end="", flush=True)
+def _progress(collected: int, skipped: int, scanned: int) -> None:
+    print(f"\r  Scanned {scanned} | Collected {collected} messages | Skipped {skipped} system msgs", end="", flush=True)
 
 
 def _print_export_results(results: dict[str, Path]) -> None:

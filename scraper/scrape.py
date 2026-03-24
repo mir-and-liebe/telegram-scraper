@@ -2,21 +2,29 @@
 
 Key design decisions:
   - NEVER sends messages, only reads.
+  - Skips MessageService (system messages) client-side immediately — no processing overhead.
   - Handles FloodWaitError with exponential backoff.
-  - Targets ~3 000 messages/minute throughput (Telegram's practical ceiling).
-  - Supports full-history and last-N-days modes.
+  - Uses Telethon's async iterator for memory-efficient streaming.
+  - Caches sender lookups to avoid redundant API calls.
+  - Supports full-history, last-N-days, and last-N-messages modes.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator
+from typing import Callable
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    MessageService,
+    MessageEmpty,
+    User,
+)
 
 
 # ── Data types ───────────────────────────────────────────────────────────────
@@ -81,17 +89,17 @@ async def get_messages(
     download_media: bool = False,
     media_dir: str = "output/media",
     media_semaphore: asyncio.Semaphore | None = None,
-    progress_callback=None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> list[ScrapedMessage]:
-    """Scrape messages from *group*.
+    """Scrape messages from *group*, skipping all system/service messages.
 
     Args:
         days: If set, only fetch messages from the last N days.
-        limit: Max number of messages to fetch. None = all.
+        limit: Max number of **real** messages to collect. None = all.
         download_media: Whether to download attached media.
         media_dir: Directory for downloaded media files.
         media_semaphore: Semaphore for parallel media downloads (max 5).
-        progress_callback: Called with (fetched_count, total_estimate) periodically.
+        progress_callback: Called with (collected, skipped, total_scanned).
     """
     offset_date = None
     if days is not None:
@@ -102,65 +110,71 @@ async def get_messages(
 
     messages: list[ScrapedMessage] = []
     media_tasks: list[asyncio.Task] = []
-    count = 0
-    batch_size = 100  # Telegram returns up to 100 per request
+    sender_cache: dict[int, str] = {}
+    skipped = 0
+    scanned = 0
 
-    while True:
-        try:
-            batch: list = []
-            async for msg in client.iter_messages(
-                group.id,
-                limit=min(batch_size, limit - count) if limit else batch_size,
-                offset_date=offset_date if not messages else None,
-                min_id=0,
-                reverse=False,
-            ):
-                # If we're doing a date-bounded scrape, stop at the boundary
-                if offset_date and msg.date and msg.date < offset_date:
-                    break
+    try:
+        async for msg in client.iter_messages(
+            group.id,
+            limit=None,  # We handle our own limit after filtering
+            offset_date=offset_date,
+            wait_time=0,  # No extra delay between batches
+        ):
+            scanned += 1
 
-                sender_name = await _resolve_sender(client, msg)
-                scraped = ScrapedMessage(
-                    id=msg.id,
-                    date=msg.date,
-                    sender_id=msg.sender_id,
-                    sender_name=sender_name,
-                    text=msg.text or "",
-                    media_type=_classify_media(msg),
-                    reply_to_msg_id=msg.reply_to.reply_to_msg_id if msg.reply_to else None,
-                    views=msg.views,
-                    forwards=msg.forwards,
+            # Skip system messages (user joined, left, pinned, etc.)
+            if isinstance(msg, (MessageService, MessageEmpty)):
+                skipped += 1
+                if progress_callback and scanned % 500 == 0:
+                    progress_callback(len(messages), skipped, scanned)
+                continue
+
+            # Skip messages with no text and no media (empty messages)
+            if not msg.text and not msg.media:
+                skipped += 1
+                continue
+
+            # Resolve sender name with caching
+            sender_name = await _resolve_sender_cached(client, msg, sender_cache)
+
+            scraped = ScrapedMessage(
+                id=msg.id,
+                date=msg.date,
+                sender_id=msg.sender_id,
+                sender_name=sender_name,
+                text=msg.text or "",
+                media_type=_classify_media(msg),
+                reply_to_msg_id=msg.reply_to.reply_to_msg_id if msg.reply_to else None,
+                views=msg.views,
+                forwards=msg.forwards,
+            )
+            messages.append(scraped)
+
+            if download_media and msg.media:
+                task = asyncio.create_task(
+                    _download_media(client, msg, media_dir, media_semaphore, scraped)
                 )
-                messages.append(scraped)
-                batch.append(scraped)
+                media_tasks.append(task)
 
-                if download_media and msg.media:
-                    task = asyncio.create_task(
-                        _download_media(client, msg, media_dir, media_semaphore, scraped)
-                    )
-                    media_tasks.append(task)
+            # Progress update every 100 real messages
+            if progress_callback and len(messages) % 100 == 0:
+                progress_callback(len(messages), skipped, scanned)
 
-                count += 1
-                if limit and count >= limit:
-                    break
-
-            if progress_callback:
-                progress_callback(count, limit)
-
-            # If batch was empty or we hit limit, we're done
-            if not batch or (limit and count >= limit):
+            # Check our limit on real messages collected
+            if limit and len(messages) >= limit:
                 break
 
-            # Use the oldest message date in this batch as offset for next
-            offset_date = batch[-1].date
+    except FloodWaitError as e:
+        wait = e.seconds + 5
+        print(f"\n  Rate limited — waiting {wait}s...")
+        await asyncio.sleep(wait)
 
-        except FloodWaitError as e:
-            wait = e.seconds + 5  # small buffer
-            print(f"\n  Rate limited — waiting {wait}s (FloodWaitError)...")
-            await asyncio.sleep(wait)
-            continue
+    # Final progress
+    if progress_callback:
+        progress_callback(len(messages), skipped, scanned)
 
-    # Wait for any pending media downloads
+    # Wait for pending media downloads
     if media_tasks:
         print(f"  Waiting for {len(media_tasks)} media downloads...")
         await asyncio.gather(*media_tasks, return_exceptions=True)
@@ -170,15 +184,29 @@ async def get_messages(
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+async def _resolve_sender_cached(
+    client: TelegramClient, msg, cache: dict[int, str]
+) -> str:
+    """Resolve sender name with an in-memory cache to avoid repeated API calls."""
+    sender_id = msg.sender_id
+    if sender_id is not None and sender_id in cache:
+        return cache[sender_id]
+
+    name = await _resolve_sender(client, msg)
+
+    if sender_id is not None:
+        cache[sender_id] = name
+    return name
+
+
 async def _resolve_sender(client: TelegramClient, msg) -> str:
     """Best-effort sender name from the message."""
-    if msg.sender is None:
+    sender = msg.sender
+    if sender is None:
         try:
             sender = await msg.get_sender()
         except Exception:
-            sender = None
-    else:
-        sender = msg.sender
+            return "Unknown"
 
     if sender is None:
         return "Unknown"
