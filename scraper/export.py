@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from .scrape import GroupInfo, ScrapedMessage
 
+logger = logging.getLogger(__name__)
 
-# ── JSON ─────────────────────────────────────────────────────────────────────
+
+# -- JSON ---------------------------------------------------------------------
 
 def export_json(
     messages: list[ScrapedMessage],
@@ -34,13 +38,17 @@ def export_json(
         "messages": [_msg_dict(m) for m in messages],
     }
 
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    logger.info("Exported JSON: %s (%d messages)", path, len(messages))
     return path
 
 
-# ── CSV ──────────────────────────────────────────────────────────────────────
+# -- CSV ----------------------------------------------------------------------
 
-CSV_FIELDS = [
+CSV_FIELDS: list[str] = [
     "id", "date", "sender_id", "sender_name", "text",
     "media_type", "media_path", "reply_to_msg_id", "views", "forwards",
 ]
@@ -61,17 +69,26 @@ def export_csv(
         for m in messages:
             writer.writerow(_msg_dict(m))
 
+    logger.info("Exported CSV: %s (%d messages)", path, len(messages))
     return path
 
 
-# ── Markdown (Obsidian) ─────────────────────────────────────────────────────
+# -- Markdown (Obsidian) ------------------------------------------------------
 
 def export_markdown(
     messages: list[ScrapedMessage],
     group: GroupInfo,
     output_dir: str = "output",
 ) -> Path:
-    """Write messages as an Obsidian-ready Markdown file. Returns the output path."""
+    """Write messages as an Obsidian-ready Markdown file. Returns the output path.
+
+    Format:
+      - YAML front matter with tags, source info, and metadata.
+      - Messages grouped by date (newest first), then by time within each day.
+      - Each message is an H3 with timestamp and sender.
+      - Media attachments shown as italic labels.
+      - Horizontal rules between messages.
+    """
     out = _prepare_dir(output_dir)
     path = out / f"{_safe_name(group.title)}.md"
 
@@ -94,6 +111,8 @@ def export_markdown(
     lines.append("  - type/notes")
     lines.append("  - source/telegram")
     lines.append(f'source_group: "{group.title}"')
+    if group.username:
+        lines.append(f'source_username: "@{group.username}"')
     lines.append(f'scraped_at: "{today}"')
     lines.append(f"message_count: {len(messages)}")
     lines.append("---")
@@ -106,18 +125,23 @@ def export_markdown(
         lines.append("")
 
         # Sort messages within each day newest-first
-        day_msgs = sorted(by_date[date_str], key=lambda m: m.date, reverse=True)
+        day_msgs = sorted(
+            by_date[date_str], key=lambda m: m.date, reverse=True
+        )
 
         for m in day_msgs:
             time_str = m.date.strftime("%H:%M") if m.date else "??:??"
-            lines.append(f"### {time_str} — {m.sender_name}")
+            lines.append(f"### {time_str} -- {m.sender_name}")
             lines.append("")
 
             text = m.text.strip() if m.text else ""
             if text:
                 lines.append(text)
             if m.media_type:
-                lines.append(f"*[{m.media_type}]*")
+                media_label = f"*[{m.media_type}]*"
+                if m.media_path:
+                    media_label = f"*[{m.media_type}: {m.media_path}]*"
+                lines.append(media_label)
             if not text and not m.media_type:
                 lines.append("*(empty message)*")
 
@@ -126,16 +150,17 @@ def export_markdown(
             lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Exported Markdown: %s (%d messages)", path, len(messages))
     return path
 
 
-# ── Batch export ─────────────────────────────────────────────────────────────
+# -- Batch export -------------------------------------------------------------
 
 def export_all(
     messages: list[ScrapedMessage],
     group: GroupInfo,
     output_dir: str = "output",
-    formats: list[str] | None = None,
+    formats: Optional[list[str]] = None,
 ) -> dict[str, Path]:
     """Export to all requested formats. Returns {format: path}."""
     if formats is None:
@@ -152,11 +177,13 @@ def export_all(
         fn = exporters.get(fmt)
         if fn:
             results[fmt] = fn(messages, group, output_dir)
+        else:
+            logger.warning("Unknown export format: %s", fmt)
 
     return results
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 def _prepare_dir(output_dir: str) -> Path:
     p = Path(output_dir)
@@ -166,14 +193,16 @@ def _prepare_dir(output_dir: str) -> Path:
 
 def _safe_name(title: str) -> str:
     """Sanitise a group title for use as a filename."""
-    return "".join(c if c.isalnum() or c in " _-" else "_" for c in title).strip()
+    return "".join(
+        c if c.isalnum() or c in " _-" else "_" for c in title
+    ).strip()
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _msg_dict(m: ScrapedMessage) -> dict:
+def _msg_dict(m: ScrapedMessage) -> dict[str, object]:
     return {
         "id": m.id,
         "date": m.date.isoformat() if m.date else None,

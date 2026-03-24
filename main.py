@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 
 from scraper.cli import run_cli
 from scraper.client import disconnect
+
+logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
@@ -15,6 +18,9 @@ async def main() -> None:
         await run_cli()
     except KeyboardInterrupt:
         print("\nInterrupted.")
+    except Exception as exc:
+        logger.critical("Fatal error: %s", exc, exc_info=True)
+        print(f"\nFatal error: {exc}")
     finally:
         await disconnect()
 

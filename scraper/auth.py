@@ -5,6 +5,7 @@ QR login flow:
   2. Render the URL as an ASCII QR code in the terminal.
   3. Wait for the user to scan it in their Telegram app.
   4. On expiry, regenerate and display a new code.
+  5. Aggressively check is_user_authorized() to detect success.
 
 Phone login flow (fallback):
   1. Prompt for phone number.
@@ -16,49 +17,46 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import sys
 
-import qrcode
+import qrcode  # type: ignore[import-untyped]
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
+logger = logging.getLogger(__name__)
 
-# ── QR code auth ─────────────────────────────────────────────────────────────
+
+# -- QR code auth ------------------------------------------------------------
 
 async def qr_login(client: TelegramClient) -> bool:
     """Attempt QR-code login. Returns True on success, False on failure."""
     try:
         qr = await client.qr_login()
     except Exception as exc:
-        print(f"QR login unavailable: {exc}")
+        logger.warning("QR login unavailable: %s", exc)
         return False
 
     print("\nScan this QR code with your Telegram app:")
-    print("  (Telegram → Settings → Devices → Link Desktop Device)\n")
+    print("  (Telegram -> Settings -> Devices -> Link Desktop Device)\n")
     _render_qr(qr.url)
 
     max_attempts = 20
     for attempt in range(max_attempts):
-        try:
-            await qr.wait(timeout=15)
+        # Check authorization *before* waiting -- the scan may already
+        # have succeeded between iterations.
+        if await client.is_user_authorized():
             print("\nQR login successful!")
             return True
-        except asyncio.TimeoutError:
-            # Check if we got authorized while waiting
+
+        try:
+            await qr.wait(timeout=15)
+            # wait() returned normally -- check auth
             if await client.is_user_authorized():
                 print("\nQR login successful!")
                 return True
-            # QR expired — regenerate
-            try:
-                await qr.recreate()
-                print(f"\nQR code expired — scan the new one (attempt {attempt + 2}/{max_attempts}):\n")
-                _render_qr(qr.url)
-            except Exception:
-                # Check one more time if authorized
-                if await client.is_user_authorized():
-                    print("\nQR login successful!")
-                    return True
-                return False
+        except asyncio.TimeoutError:
+            pass  # will check auth at top of loop
         except SessionPasswordNeededError:
             return await _handle_2fa(client)
         except Exception as exc:
@@ -66,8 +64,22 @@ async def qr_login(client: TelegramClient) -> bool:
             if await client.is_user_authorized():
                 print("\nQR login successful!")
                 return True
-            print(f"\nQR login error: {exc}")
-            return False
+            logger.debug("QR wait error (attempt %d): %s", attempt + 1, exc)
+
+        # If not authorized, try to regenerate the QR code
+        if not await client.is_user_authorized():
+            try:
+                await qr.recreate()
+                print(
+                    f"\nQR code expired -- scan the new one "
+                    f"(attempt {attempt + 2}/{max_attempts}):\n"
+                )
+                _render_qr(qr.url)
+            except Exception:
+                if await client.is_user_authorized():
+                    print("\nQR login successful!")
+                    return True
+                logger.debug("Failed to recreate QR code on attempt %d", attempt + 1)
 
     # Final check
     if await client.is_user_authorized():
@@ -92,11 +104,13 @@ def _render_qr(data: str) -> None:
     print(buf.getvalue())
 
 
-# ── Phone auth (fallback) ───────────────────────────────────────────────────
+# -- Phone auth (fallback) ---------------------------------------------------
 
 async def phone_login(client: TelegramClient) -> bool:
     """Interactive phone-number login. Returns True on success."""
-    phone = input("\nEnter your phone number (with country code, e.g. +1234567890): ").strip()
+    phone = input(
+        "\nEnter your phone number (with country code, e.g. +1234567890): "
+    ).strip()
     if not phone:
         print("No phone number provided.")
         return False
@@ -104,7 +118,7 @@ async def phone_login(client: TelegramClient) -> bool:
     try:
         await client.send_code_request(phone)
     except Exception as exc:
-        print(f"Failed to send code: {exc}")
+        logger.error("Failed to send code: %s", exc, exc_info=True)
         return False
 
     code = input("Enter the code you received: ").strip()
@@ -116,21 +130,23 @@ async def phone_login(client: TelegramClient) -> bool:
     except SessionPasswordNeededError:
         return await _handle_2fa(client)
     except Exception as exc:
-        print(f"Sign-in failed: {exc}")
+        logger.error("Sign-in failed: %s", exc, exc_info=True)
         return False
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 async def _handle_2fa(client: TelegramClient) -> bool:
     """Prompt for 2FA password and complete login."""
-    password = input("Two-factor authentication enabled. Enter your password: ").strip()
+    password = input(
+        "Two-factor authentication enabled. Enter your password: "
+    ).strip()
     try:
         await client.sign_in(password=password)
         print("Login successful (2FA)!")
         return True
     except Exception as exc:
-        print(f"2FA login failed: {exc}")
+        logger.error("2FA login failed: %s", exc, exc_info=True)
         return False
 
 
@@ -140,8 +156,9 @@ async def ensure_authorized(client: TelegramClient) -> None:
 
     if await client.is_user_authorized():
         me = await client.get_me()
-        name = me.first_name or me.username or str(me.id)
-        print(f"Already logged in as {name}.")
+        if me is not None:
+            name = me.first_name or me.username or str(me.id)
+            print(f"Already logged in as {name}.")
         return
 
     print("Not logged in. Attempting QR code authentication...")

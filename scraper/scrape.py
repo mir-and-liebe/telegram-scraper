@@ -1,60 +1,88 @@
-"""Core scraping logic — read-only message retrieval with rate-limit handling.
+"""Core scraping logic -- read-only message retrieval with rate-limit handling.
 
 Key design decisions:
   - NEVER sends messages, only reads.
-  - Skips MessageService (system messages) client-side immediately — no processing overhead.
+  - Skips MessageService (system messages) client-side immediately.
   - Handles FloodWaitError with exponential backoff.
   - Uses Telethon's async iterator for memory-efficient streaming.
   - Caches sender lookups to avoid redundant API calls.
   - Supports full-history, last-N-days, and last-N-messages modes.
+  - Handles disconnection mid-scrape, empty groups, and access errors.
+  - Supports an overall timeout for the scrape operation.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import logging
+import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Any, Callable, Optional
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    FloodWaitError,
+)
 from telethon.tl.types import (
     Channel,
     Chat,
-    MessageService,
     MessageEmpty,
+    MessageService,
     User,
 )
 
+logger = logging.getLogger(__name__)
 
-# ── Data types ───────────────────────────────────────────────────────────────
+
+# -- Data types ---------------------------------------------------------------
 
 @dataclass
 class ScrapedMessage:
     """Flat representation of a single message."""
+
     id: int
     date: datetime
-    sender_id: int | None
+    sender_id: Optional[int]
     sender_name: str
     text: str
-    media_type: str | None = None
-    media_path: str | None = None
-    reply_to_msg_id: int | None = None
-    views: int | None = None
-    forwards: int | None = None
+    media_type: Optional[str] = None
+    media_path: Optional[str] = None
+    reply_to_msg_id: Optional[int] = None
+    views: Optional[int] = None
+    forwards: Optional[int] = None
 
 
 @dataclass
 class GroupInfo:
     """Metadata about a group or channel."""
+
     id: int
     title: str
-    username: str | None = None
-    member_count: int | None = None
+    username: Optional[str] = None
+    member_count: Optional[int] = None
     is_channel: bool = False
 
 
-# ── Group listing ────────────────────────────────────────────────────────────
+@dataclass
+class ScrapeResult:
+    """Result of a scrape operation with statistics."""
+
+    messages: list[ScrapedMessage] = field(default_factory=list)
+    scanned: int = 0
+    skipped: int = 0
+    error: Optional[str] = None
+    timed_out: bool = False
+    elapsed_seconds: float = 0.0
+
+    @property
+    def collected(self) -> int:
+        return len(self.messages)
+
+
+# -- Group listing ------------------------------------------------------------
 
 async def get_groups(client: TelegramClient) -> list[GroupInfo]:
     """Return all groups/channels the user is a member of."""
@@ -78,62 +106,75 @@ async def get_groups(client: TelegramClient) -> list[GroupInfo]:
     return groups
 
 
-# ── Message scraping ─────────────────────────────────────────────────────────
+# -- Message scraping ---------------------------------------------------------
 
 async def get_messages(
     client: TelegramClient,
     group: GroupInfo,
     *,
-    days: int | None = None,
-    limit: int | None = None,
+    days: Optional[int] = None,
+    limit: Optional[int] = None,
     download_media: bool = False,
     media_dir: str = "output/media",
-    media_semaphore: asyncio.Semaphore | None = None,
-    progress_callback: Callable[[int, int, int], None] | None = None,
-) -> list[ScrapedMessage]:
+    media_semaphore: Optional[asyncio.Semaphore] = None,
+    progress_callback: Optional[Callable[[int, int, int], None]] = None,
+    timeout: float = 3600.0,
+) -> ScrapeResult:
     """Scrape messages from *group*, skipping all system/service messages.
 
     Args:
         days: If set, only fetch messages from the last N days.
-        limit: Max number of **real** messages to collect. None = all.
+        limit: Max number of real messages to collect. None = all.
         download_media: Whether to download attached media.
         media_dir: Directory for downloaded media files.
         media_semaphore: Semaphore for parallel media downloads (max 5).
         progress_callback: Called with (collected, skipped, total_scanned).
+        timeout: Overall timeout in seconds (default: 1 hour).
+
+    Returns:
+        ScrapeResult with messages and statistics.
     """
-    offset_date = None
+    offset_date: Optional[datetime] = None
     if days is not None:
         offset_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     if media_semaphore is None:
         media_semaphore = asyncio.Semaphore(5)
 
-    messages: list[ScrapedMessage] = []
-    media_tasks: list[asyncio.Task] = []
+    result = ScrapeResult()
+    media_tasks: list[asyncio.Task[None]] = []
     sender_cache: dict[int, str] = {}
-    skipped = 0
-    scanned = 0
+    start_time = asyncio.get_event_loop().time()
 
     try:
-        print(f"  [debug] Starting iter_messages for group_id={group.id}, offset_date={offset_date}")
         async for msg in client.iter_messages(
             group.id,
             limit=None,  # We handle our own limit after filtering
             offset_date=offset_date,
-            wait_time=0,  # No extra delay between batches
+            wait_time=0,
         ):
-            scanned += 1
+            result.scanned += 1
+
+            # Check overall timeout
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > timeout:
+                logger.warning(
+                    "Scrape timeout reached (%.0fs) after %d messages",
+                    timeout, result.collected,
+                )
+                result.timed_out = True
+                break
 
             # Skip system messages (user joined, left, pinned, etc.)
             if isinstance(msg, (MessageService, MessageEmpty)):
-                skipped += 1
-                if progress_callback and scanned % 500 == 0:
-                    progress_callback(len(messages), skipped, scanned)
+                result.skipped += 1
+                if progress_callback and result.scanned % 500 == 0:
+                    progress_callback(result.collected, result.skipped, result.scanned)
                 continue
 
             # Skip messages with no text and no media (empty messages)
             if not msg.text and not msg.media:
-                skipped += 1
+                result.skipped += 1
                 continue
 
             # Resolve sender name with caching
@@ -146,11 +187,13 @@ async def get_messages(
                 sender_name=sender_name,
                 text=msg.text or "",
                 media_type=_classify_media(msg),
-                reply_to_msg_id=msg.reply_to.reply_to_msg_id if msg.reply_to else None,
+                reply_to_msg_id=(
+                    msg.reply_to.reply_to_msg_id if msg.reply_to else None
+                ),
                 views=msg.views,
                 forwards=msg.forwards,
             )
-            messages.append(scraped)
+            result.messages.append(scraped)
 
             if download_media and msg.media:
                 task = asyncio.create_task(
@@ -159,38 +202,54 @@ async def get_messages(
                 media_tasks.append(task)
 
             # Progress update every 100 real messages
-            if progress_callback and len(messages) % 100 == 0:
-                progress_callback(len(messages), skipped, scanned)
+            if progress_callback and result.collected % 100 == 0:
+                progress_callback(result.collected, result.skipped, result.scanned)
 
             # Check our limit on real messages collected
-            if limit and len(messages) >= limit:
+            if limit and result.collected >= limit:
                 break
 
+    except (ChannelPrivateError, ChatAdminRequiredError) as exc:
+        msg_text = f"No read access to '{group.title}': {exc}"
+        logger.error(msg_text)
+        result.error = msg_text
     except FloodWaitError as e:
         wait = e.seconds + 5
-        print(f"\n  Rate limited — waiting {wait}s...")
+        logger.warning("Rate limited -- waiting %ds...", wait)
+        print(f"\n  Rate limited -- waiting {wait}s...")
         await asyncio.sleep(wait)
+        result.error = f"Rate limited after {result.collected} messages (waited {wait}s)"
+    except ConnectionError as exc:
+        msg_text = f"Disconnected mid-scrape after {result.collected} messages: {exc}"
+        logger.error(msg_text)
+        result.error = msg_text
     except Exception as exc:
-        import traceback
-        print(f"\n  [error] Scraping failed: {exc}")
+        msg_text = f"Scraping failed: {exc}"
+        logger.error(msg_text, exc_info=True)
+        result.error = msg_text
         traceback.print_exc()
+
+    result.elapsed_seconds = asyncio.get_event_loop().time() - start_time
 
     # Final progress
     if progress_callback:
-        progress_callback(len(messages), skipped, scanned)
+        progress_callback(result.collected, result.skipped, result.scanned)
 
     # Wait for pending media downloads
     if media_tasks:
-        print(f"  Waiting for {len(media_tasks)} media downloads...")
-        await asyncio.gather(*media_tasks, return_exceptions=True)
+        logger.info("Waiting for %d media downloads...", len(media_tasks))
+        results = await asyncio.gather(*media_tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.warning("Media download %d failed: %s", i, r)
 
-    return messages
+    return result
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 async def _resolve_sender_cached(
-    client: TelegramClient, msg, cache: dict[int, str]
+    client: TelegramClient, msg: Any, cache: dict[int, str]
 ) -> str:
     """Resolve sender name with an in-memory cache to avoid repeated API calls."""
     sender_id = msg.sender_id
@@ -204,7 +263,7 @@ async def _resolve_sender_cached(
     return name
 
 
-async def _resolve_sender(client: TelegramClient, msg) -> str:
+async def _resolve_sender(client: TelegramClient, msg: Any) -> str:
     """Best-effort sender name from the message."""
     sender = msg.sender
     if sender is None:
@@ -224,7 +283,7 @@ async def _resolve_sender(client: TelegramClient, msg) -> str:
     return str(getattr(sender, "id", "Unknown"))
 
 
-def _classify_media(msg) -> str | None:
+def _classify_media(msg: Any) -> Optional[str]:
     """Return a short label for the media type, or None."""
     if msg.photo:
         return "photo"
@@ -245,7 +304,7 @@ def _classify_media(msg) -> str | None:
 
 async def _download_media(
     client: TelegramClient,
-    msg,
+    msg: Any,
     media_dir: str,
     sem: asyncio.Semaphore,
     scraped: ScrapedMessage,
@@ -257,12 +316,13 @@ async def _download_media(
             if path:
                 scraped.media_path = str(path)
         except FloodWaitError as e:
+            logger.warning("Media download rate limited, waiting %ds", e.seconds + 2)
             await asyncio.sleep(e.seconds + 2)
             try:
                 path = await client.download_media(msg, file=media_dir)
                 if path:
                     scraped.media_path = str(path)
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as exc:
+                logger.warning("Media download retry failed: %s", exc)
+        except Exception as exc:
+            logger.warning("Media download failed: %s", exc)
