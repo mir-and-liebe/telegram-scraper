@@ -115,6 +115,7 @@ async def get_messages(
     scanned = 0
 
     try:
+        print(f"  [debug] Starting iter_messages for group_id={group.id}, offset_date={offset_date}")
         async for msg in client.iter_messages(
             group.id,
             limit=None,  # We handle our own limit after filtering
@@ -169,6 +170,10 @@ async def get_messages(
         wait = e.seconds + 5
         print(f"\n  Rate limited — waiting {wait}s...")
         await asyncio.sleep(wait)
+    except Exception as exc:
+        import traceback
+        print(f"\n  [error] Scraping failed: {exc}")
+        traceback.print_exc()
 
     # Final progress
     if progress_callback:

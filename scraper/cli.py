@@ -32,17 +32,22 @@ async def run_cli() -> None:
 
         choice = input("Select an option [1-4]: ").strip()
 
-        if choice == "1":
-            await _list_groups(client)
-        elif choice == "2":
-            await _interactive_scrape(client)
-        elif choice == "3":
-            await _batch_scrape(client)
-        elif choice == "4":
-            print("Goodbye.")
-            break
-        else:
-            print("Invalid choice.")
+        try:
+            if choice == "1":
+                await _list_groups(client)
+            elif choice == "2":
+                await _interactive_scrape(client)
+            elif choice == "3":
+                await _batch_scrape(client)
+            elif choice == "4":
+                print("Goodbye.")
+                break
+            else:
+                print("Invalid choice.")
+        except Exception as exc:
+            import traceback
+            print(f"\n  ERROR: {exc}")
+            traceback.print_exc()
 
 
 # ── List groups ──────────────────────────────────────────────────────────────
@@ -74,42 +79,51 @@ async def _list_groups(client) -> list[GroupInfo]:
 
 async def _interactive_scrape(client) -> None:
     """Let the user pick a group and configure the scrape."""
-    groups = await _list_groups(client)
-    if not groups:
-        return
-
-    # Select group
-    raw = input(f"\nEnter group number [1-{len(groups)}]: ").strip()
     try:
-        idx = int(raw) - 1
-        group = groups[idx]
-    except (ValueError, IndexError):
-        print("Invalid selection.")
-        return
+        groups = await _list_groups(client)
+        if not groups:
+            return
 
-    # Configure scrape
-    config = _get_scrape_config()
+        # Select group
+        raw = input(f"\nEnter group number [1-{len(groups)}]: ").strip()
+        try:
+            idx = int(raw) - 1
+            group = groups[idx]
+        except (ValueError, IndexError):
+            print("Invalid selection.")
+            return
 
-    # Run scrape
-    print(f"\nScraping: {group.title}...")
-    messages = await get_messages(
-        client,
-        group,
-        days=config["days"],
-        limit=config["limit"],
-        download_media=config["download_media"],
-        progress_callback=_progress,
-    )
+        # Configure scrape
+        config = _get_scrape_config()
 
-    if not messages:
-        print("No messages found.")
-        return
+        # Run scrape
+        print(f"\nScraping: {group.title}...")
+        print(f"  Config: days={config['days']}, limit={config['limit']}, media={config['download_media']}")
+        print(f"  Formats: {config['formats']}, output: {config['output_dir']}")
 
-    print(f"\nFetched {len(messages)} messages.")
+        messages = await get_messages(
+            client,
+            group,
+            days=config["days"],
+            limit=config["limit"],
+            download_media=config["download_media"],
+            progress_callback=_progress,
+        )
 
-    # Export
-    results = export_all(messages, group, config["output_dir"], config["formats"])
-    _print_export_results(results)
+        if not messages:
+            print("\nNo messages found.")
+            return
+
+        print(f"\n\nCollected {len(messages)} messages. Exporting...")
+
+        # Export
+        results = export_all(messages, group, config["output_dir"], config["formats"])
+        _print_export_results(results)
+
+    except Exception as exc:
+        import traceback
+        print(f"\n\n  ERROR during scrape: {exc}")
+        traceback.print_exc()
 
 
 # ── Batch scrape from CSV ────────────────────────────────────────────────────
