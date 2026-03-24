@@ -1,0 +1,3 @@
+telethon>=1.36.0
+qrcode>=7.4
+aiohttp>=3.9.0

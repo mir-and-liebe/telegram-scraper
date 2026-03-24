@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "telegram-scraper"
+version = "1.0.0"
+description = "Read-only Telegram group/channel scraper with QR auth and multi-format export"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "telethon>=1.36.0",
+    "qrcode>=7.4",
+    "aiohttp>=3.9.0",
+]
+
+[project.scripts]
+telegram-scraper = "main:main_sync"
+
+[tool.setuptools.packages.find]
+include = ["scraper*"]
